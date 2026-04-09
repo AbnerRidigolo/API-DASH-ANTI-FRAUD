@@ -7,20 +7,28 @@ Endpoints:
   POST /webhook              — simula recebimento de evento da API Mission
 
 Rodar localmente:
-  pip install fastapi uvicorn pydantic
+  pip install fastapi uvicorn pydantic sqlalchemy python-dotenv
   uvicorn app:app --reload --port 8000
 
 Docs interativos: http://localhost:8000/docs
 """
 
-from fastapi import FastAPI, HTTPException, Query
-from fastapi.responses import JSONResponse
+import os
+from dotenv import load_dotenv
+load_dotenv()
+
+from fastapi import FastAPI, HTTPException, Query, Security, Depends
+from fastapi.responses import JSONResponse, RedirectResponse
+from fastapi.security.api_key import APIKeyHeader
 from pydantic import BaseModel, Field
 from typing import Optional, List
 from datetime import datetime
 from enum import Enum
+from sqlalchemy.orm import Session
 import math
 import random
+
+from database import init_db, get_db, MissionUnitDB, SessionLocal
 
 # ── App ──────────────────────────────────────────────────────────────────────
 
@@ -33,6 +41,18 @@ app = FastAPI(
     version="1.0.0",
     contact={"name": "Mission Brasil Product Data Team"},
 )
+
+# ── Autenticação por API Key ──────────────────────────────────────────────────
+
+_api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
+
+def _require_api_key(key: str = Security(_api_key_header)):
+    expected = os.getenv("AUTH_API_KEY", "")
+    if not expected:
+        # Modo dev: sem chave configurada, auth desabilitada
+        return
+    if key != expected:
+        raise HTTPException(status_code=403, detail="API key inválida ou ausente.")
 
 # ── Enums ────────────────────────────────────────────────────────────────────
 
@@ -338,10 +358,10 @@ def _analisar(req: AnalyzeRequest) -> AnalyzeResponse:
         analisado_em=datetime.now(),
     )
 
-# ── Mock database (para GET /mission-units e GET /report) ────────────────────
+# ── Inicialização do Banco e Seed ────────────────────────────────────────────
 
 def _gerar_mock_db():
-    """Gera 50 MUs sintéticas para demonstração dos endpoints GET."""
+    """Gera 50 MUs sintéticas para seed inicial do banco."""
     random.seed(42)
     mus = []
     missoes_ref = [
@@ -361,19 +381,30 @@ def _gerar_mock_db():
         nivel = niveis_dist[i]
         score = {"ok": random.uniform(0,20), "atencao": random.uniform(21,45),
                  "suspeito": random.uniform(46,70), "bloqueado": random.uniform(71,100)}[nivel]
-        mus.append(MissionUnitSummary(
+        mus.append(MissionUnitDB(
             mu_id=f"MU-{1000000+i}",
             missionario_nome=random.choice(nomes),
             missao_nome=m[1],
             recompensa_rs=float(m[3]),
             status="Validando Dados" if nivel != "ok" else "Aprovado",
             fraud_score=round(score, 1),
-            fraud_nivel=FraudNivel(nivel),
+            fraud_nivel=nivel,
             n_flags={"ok":0,"atencao":1,"suspeito":2,"bloqueado":3}[nivel],
         ))
     return mus
 
-_MOCK_DB = _gerar_mock_db()
+
+@app.on_event("startup")
+def startup_event():
+    init_db()
+    db = SessionLocal()
+    try:
+        if db.query(MissionUnitDB).count() == 0:
+            for mu in _gerar_mock_db():
+                db.add(mu)
+            db.commit()
+    finally:
+        db.close()
 
 # ── Endpoints ─────────────────────────────────────────────────────────────────
 
@@ -382,8 +413,9 @@ _MOCK_DB = _gerar_mock_db()
     response_model=AnalyzeResponse,
     summary="Analisar uma MU — retorna fraud score e flags",
     tags=["Análise"],
+    dependencies=[Depends(_require_api_key)],
 )
-def analyze(req: AnalyzeRequest):
+def analyze(req: AnalyzeRequest, db: Session = Depends(get_db)):
     """
     Recebe os dados completos de uma Mission Unit (MU) e retorna:
     - **fraud_score**: 0–100
@@ -394,7 +426,27 @@ def analyze(req: AnalyzeRequest):
     Detecta: check-in antes da criação, duração zero, checkout antecipado,
     GPS fora do local, GPS divergente, histórico de reprovações, atividades ausentes.
     """
-    return _analisar(req)
+    result = _analisar(req)
+
+    mu_record = MissionUnitDB(
+        mu_id=req.mu_id,
+        missionario_nome=req.missionario.nome,
+        missao_nome=req.missao.nome,
+        recompensa_rs=req.missao.recompensa.dinheiro,
+        status=req.status.value,
+        fraud_score=result.fraud_score,
+        fraud_nivel=result.fraud_nivel.value,
+        n_flags=len(result.flags),
+        analisado_em=result.analisado_em,
+    )
+    existing = db.query(MissionUnitDB).filter(MissionUnitDB.mu_id == req.mu_id).first()
+    if existing:
+        db.merge(mu_record)
+    else:
+        db.add(mu_record)
+    db.commit()
+
+    return result
 
 
 @app.get(
@@ -402,6 +454,7 @@ def analyze(req: AnalyzeRequest):
     response_model=List[MissionUnitSummary],
     summary="Listar MUs com filtros",
     tags=["Consulta"],
+    dependencies=[Depends(_require_api_key)],
 )
 def list_mission_units(
     fraud_nivel: Optional[FraudNivel] = Query(None, description="Filtrar por nível de risco"),
@@ -409,16 +462,30 @@ def list_mission_units(
     max_score:   float                = Query(100,  description="Score máximo"),
     limit:       int                  = Query(20,   ge=1, le=100),
     offset:      int                  = Query(0,    ge=0),
+    db: Session = Depends(get_db),
 ):
-    """
-    Lista mission units com filtros opcionais de nível de risco e score.
-    Dados sintéticos — substituir pela query no banco real quando disponível.
-    """
-    mus = _MOCK_DB
+    """Lista mission units do banco com filtros opcionais."""
+    query = db.query(MissionUnitDB)
     if fraud_nivel:
-        mus = [m for m in mus if m.fraud_nivel == fraud_nivel]
-    mus = [m for m in mus if min_score <= m.fraud_score <= max_score]
-    return mus[offset: offset + limit]
+        query = query.filter(MissionUnitDB.fraud_nivel == fraud_nivel.value)
+    query = query.filter(
+        MissionUnitDB.fraud_score >= min_score,
+        MissionUnitDB.fraud_score <= max_score,
+    )
+    records = query.offset(offset).limit(limit).all()
+    return [
+        MissionUnitSummary(
+            mu_id=r.mu_id,
+            missionario_nome=r.missionario_nome,
+            missao_nome=r.missao_nome,
+            recompensa_rs=r.recompensa_rs,
+            status=r.status,
+            fraud_score=r.fraud_score,
+            fraud_nivel=FraudNivel(r.fraud_nivel),
+            n_flags=r.n_flags,
+        )
+        for r in records
+    ]
 
 
 @app.get(
@@ -426,8 +493,9 @@ def list_mission_units(
     response_model=ReportResponse,
     summary="Relatório batch — resumo de fraude",
     tags=["Relatório"],
+    dependencies=[Depends(_require_api_key)],
 )
-def report():
+def report(db: Session = Depends(get_db)):
     """
     Retorna resumo executivo do batch atual:
     - Contagem por nível de risco
@@ -436,12 +504,15 @@ def report():
     - Top flags mais frequentes
     - MUs críticas (bloqueado + suspeito)
     """
-    mus = _MOCK_DB
-    niveis = {n: sum(1 for m in mus if m.fraud_nivel == FraudNivel(n))
+    mus = db.query(MissionUnitDB).all()
+    if not mus:
+        raise HTTPException(status_code=404, detail="Nenhuma MU no banco.")
+
+    niveis = {n: sum(1 for m in mus if m.fraud_nivel == n)
               for n in ["ok", "atencao", "suspeito", "bloqueado"]}
-    valor_total   = sum(m.recompensa_rs for m in mus)
+    valor_total    = sum(m.recompensa_rs for m in mus)
     valor_em_risco = sum(m.recompensa_rs for m in mus
-                         if m.fraud_nivel in (FraudNivel.suspeito, FraudNivel.bloqueado))
+                         if m.fraud_nivel in ("suspeito", "bloqueado"))
     taxa = round((niveis["suspeito"] + niveis["bloqueado"]) / len(mus) * 100, 1)
 
     top_flags = [
@@ -451,7 +522,7 @@ def report():
         {"flag": "gps_fora_do_local",      "ocorrencias": 4,  "impacto_rs": 480},
     ]
 
-    criticas = [m for m in mus if m.fraud_nivel in (FraudNivel.bloqueado, FraudNivel.suspeito)]
+    criticas = [m for m in mus if m.fraud_nivel in ("bloqueado", "suspeito")]
     criticas.sort(key=lambda x: -x.fraud_score)
 
     return ReportResponse(
@@ -465,7 +536,19 @@ def report():
         valor_em_risco_rs=round(valor_em_risco, 2),
         taxa_fraude_pct=taxa,
         top_flags=top_flags,
-        mus_criticas=criticas[:10],
+        mus_criticas=[
+            MissionUnitSummary(
+                mu_id=m.mu_id,
+                missionario_nome=m.missionario_nome,
+                missao_nome=m.missao_nome,
+                recompensa_rs=m.recompensa_rs,
+                status=m.status,
+                fraud_score=m.fraud_score,
+                fraud_nivel=FraudNivel(m.fraud_nivel),
+                n_flags=m.n_flags,
+            )
+            for m in criticas[:10]
+        ],
     )
 
 
@@ -474,6 +557,7 @@ def report():
     response_model=WebhookResponse,
     summary="Receber evento da API Mission Brasil",
     tags=["Webhook"],
+    dependencies=[Depends(_require_api_key)],
 )
 def webhook(event: WebhookEvent):
     """
@@ -505,4 +589,4 @@ def webhook(event: WebhookEvent):
 
 @app.get("/", include_in_schema=False)
 def root():
-    return {"status": "ok", "docs": "/docs", "version": "1.0.0"}
+    return RedirectResponse(url="/docs")
